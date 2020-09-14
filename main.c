@@ -13,6 +13,7 @@
 #include <sys/sysmacros.h>
 #include <asm/errno.h>
 #include <gtk/gtk.h>
+#include <math.h>
 #include "ini.h"
 #include "bayer.h"
 
@@ -69,6 +70,7 @@ static int current_fd;
 static int capture = 0;
 static int current_is_rear = 1;
 static cairo_surface_t *surface = NULL;
+static cairo_surface_t *raw_surface = NULL;
 static int preview_width = -1;
 static int preview_height = -1;
 
@@ -245,6 +247,12 @@ init_sensor(char *fn, int width, int height, int mbus, int rate)
 	//v4l2_ctrl_set(fd, V4L2_CID_AUTOGAIN, 1);
 	close(current_fd);
 	current_fd = fd;
+
+	// Init target buffer for the image with the correct size
+	if (raw_surface)
+		cairo_surface_destroy(raw_surface);
+
+	raw_surface = cairo_image_surface_create(CAIRO_FORMAT_RGB24, width/2, height/2);
 }
 
 static void
@@ -356,57 +364,37 @@ process_image(const int *p, int size)
 	double time_taken;
 	char fname[255];
 	char timestamp[30];
-	GdkPixbuf *pixbuf;
-	GdkPixbuf *pixbufrot;
 	GError *error = NULL;
 	double scale;
 	cairo_t *cr;
+	cairo_pattern_t *source;
+	int raw_width;
+	int raw_height;
 	t = clock();
 
 	dc1394bayer_method_t method = DC1394_BAYER_METHOD_DOWNSAMPLE;
 	dc1394color_filter_t filter = DC1394_COLOR_FILTER_BGGR;
 
-	if (capture) {
-		method = DC1394_BAYER_METHOD_SIMPLE;
-		// method = DC1394_BAYER_METHOD_VNG is slightly sharper but takes 10 seconds;
-		pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, current_width, current_height);
-	} else {
-		pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, current_width / 2, current_height / 2);
-	}
+	pixels = cairo_image_surface_get_data(raw_surface);
 
-	pixels = gdk_pixbuf_get_pixels(pixbuf);
 	dc1394_bayer_decoding_8bit((const uint8_t *) p, pixels, current_width, current_height, filter, method);
-	if (current_rotate == 0) {
-		pixbufrot = pixbuf;
-	} else if (current_rotate == 90) {
-		pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE);
-	} else if (current_rotate == 180) {
-		pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_UPSIDEDOWN);
-	} else if (current_rotate == 270) {
-		pixbufrot = gdk_pixbuf_rotate_simple(pixbuf, GDK_PIXBUF_ROTATE_CLOCKWISE);
-	}
-	if (capture) {
-		time(&rawtime);
-		tim = *(localtime(&rawtime));
-		strftime(timestamp, 30, "%F %T", &tim);
-		sprintf(fname, "%s/Pictures/Photo-%s.jpg", getenv("HOME"), timestamp);
-		printf("Saving image\n");
-		gdk_pixbuf_save(pixbufrot, fname, "jpeg", &error, "quality", "100", NULL);
-		if (error != NULL) {
-			g_printerr(error->message);
-			g_clear_error(&error);
-		}
-	} else {
-		scale = (double) preview_width / gdk_pixbuf_get_width(pixbufrot);
-		cr = cairo_create(surface);
-		cairo_set_source_rgb(cr, 0, 0, 0);
-		cairo_paint(cr);
-		cairo_scale(cr, scale, scale);
-		gdk_cairo_set_source_pixbuf(cr, pixbufrot, 0, 0);
-		cairo_pattern_set_extend(cairo_get_source(cr), CAIRO_EXTEND_NONE);
-		cairo_paint(cr);
-		gtk_widget_queue_draw_area(preview, 0, 0, preview_width, preview_height);
-	}
+	raw_width = current_width/2;
+	raw_height = current_height/2;
+	scale = (double) preview_width / (current_width/2);
+	cr = cairo_create(surface);
+	cairo_set_source_rgb(cr, 0.5, 0.5, 0.5);
+	cairo_paint(cr);
+	cairo_translate(cr, raw_width/2, raw_height/2);
+	cairo_rotate(cr, 90.*(M_PI/180.));
+	cairo_translate(cr, -preview_height/2, -preview_width/2);
+	//cairo_scale(cr, scale, scale);
+
+	source = cairo_pattern_create_for_surface(raw_surface);
+	cairo_pattern_set_filter(source, CAIRO_FILTER_NEAREST);
+	cairo_set_source(cr, source);
+	cairo_pattern_destroy(source);
+	cairo_paint(cr);
+	gtk_widget_queue_draw_area(preview, 0, 0, preview_width, preview_height);
 	capture = 0;
 	t = clock() - t;
 	time_taken = ((double) t) / CLOCKS_PER_SEC;
@@ -436,6 +424,8 @@ preview_configure(GtkWidget *widget, GdkEventConfigure *event)
 
 	preview_width = gtk_widget_get_allocated_width(widget);
 	preview_height = gtk_widget_get_allocated_height(widget);
+
+	g_printerr("Preview area is now %dx%d\n", preview_width, preview_height);
 
 	cr = cairo_create(surface);
 	cairo_set_source_rgb(cr, 0, 0, 0);
