@@ -68,6 +68,10 @@ static int current_fmt = 0;
 static int current_rotate = 0;
 static int current_fd;
 static int capture = 0;
+static int exposure = 0;
+static int exposure_max = 0;
+static int gain = 0;
+static int gain_max = 0;
 static int current_is_rear = 1;
 static cairo_surface_t *surface = NULL;
 static int preview_width = -1;
@@ -243,7 +247,15 @@ init_sensor(char *fn, int width, int height, int mbus, int rate)
 		fmt.format.code);
 
 	// Placeholder, default is also 1
-	//v4l2_ctrl_set(fd, V4L2_CID_AUTOGAIN, 1);
+	// Exposure on the ov5640 is in number of lines
+	v4l2_ctrl_set(fd, V4L2_CID_AUTOGAIN, 0);
+	v4l2_ctrl_set(fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+	v4l2_ctrl_set(fd, V4L2_CID_EXPOSURE, height/2);
+	v4l2_ctrl_set(fd, V4L2_CID_GAIN, 0);
+	gain = 0;
+	exposure = height/2;
+	exposure_max = height;
+	gain_max = 1024;
 	close(current_fd);
 	current_fd = fd;
 }
@@ -362,8 +374,8 @@ process_image(const int *p, int size)
 	GError *error = NULL;
 	double scale;
 	cairo_t *cr;
-	t = clock();
-
+	int feedback;
+	int iso;
 	dc1394bayer_method_t method = DC1394_BAYER_METHOD_DOWNSAMPLE;
 	dc1394color_filter_t filter = DC1394_COLOR_FILTER_BGGR;
 
@@ -376,7 +388,13 @@ process_image(const int *p, int size)
 	} else {
 		pixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, current_width / 6, current_height / 6);
 		pixels = gdk_pixbuf_get_pixels(pixbuf);
-		quick_debayer_bggr8((const uint8_t *)p, pixels, current_width, current_height, 3);
+		t = clock();
+		feedback = quick_debayer_bggr8((const uint8_t *)p, pixels, current_width, current_height, 3);
+		t = clock() - t;
+		time_taken = ((double) t) / CLOCKS_PER_SEC;
+		iso = 100+((float)gain/(float)gain_max * 6400);
+		printf("%f fps (%f ms) feedback %d, iso %d, exposure %fdeg\n", 1.0 / time_taken, time_taken*1000, feedback,
+				iso, (float)exposure/(float)exposure_max*360.0);
 	}
 
 	if (current_rotate == 0) {
@@ -411,9 +429,28 @@ process_image(const int *p, int size)
 		gtk_widget_queue_draw_area(preview, 0, 0, preview_width, preview_height);
 	}
 	capture = 0;
-	t = clock() - t;
-	time_taken = ((double) t) / CLOCKS_PER_SEC;
-	printf("%f fps\n", 1.0 / time_taken);
+	if (feedback > 0) {
+		exposure = exposure + (exposure_max/100.0 * feedback);
+		if(exposure > exposure_max) {
+			exposure = exposure_max;
+			gain = gain + (gain_max/600.0 * feedback);
+		}
+		if ( gain > gain_max ) {
+			gain = gain_max;
+		}
+	}
+	if(feedback < 0) {
+		gain = gain + (gain_max/600.0 * feedback);
+		if(gain < 1){
+			gain = 0;
+			exposure = exposure + (exposure_max/100.0 * feedback);
+		}
+		if(exposure < 1){
+			exposure = 0;
+		}
+	}
+	v4l2_ctrl_set(current_fd, V4L2_CID_EXPOSURE, exposure);
+	v4l2_ctrl_set(current_fd, V4L2_CID_GAIN, gain);
 }
 
 static gboolean
