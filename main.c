@@ -58,6 +58,8 @@ struct camerainfo {
 	int gain_ctrl;
 	int gain_max;
 
+	int wb_gain_max;
+
 	int has_af_c;
 	int has_af_s;
 };
@@ -97,6 +99,8 @@ static int auto_exposure = 1;
 static int exposure = 1;
 static int auto_gain = 1;
 static int gain = 1;
+static int red_balance = 0;
+static int blue_balance = 0;
 static int burst_length = 10;
 static char burst_dir[23];
 static char processing_script[512];
@@ -452,6 +456,8 @@ init_sensor(char *fn, int width, int height, int mbus, int rate)
 		current.gain_max = v4l2_ctrl_get_max(fd, V4L2_CID_ANALOGUE_GAIN);
 	}
 
+	current.wb_gain_max = v4l2_ctrl_get_max(fd, V4L2_CID_RED_BALANCE);
+
 	auto_exposure = 1;
 	auto_gain = 1;
 	draw_controls();
@@ -574,6 +580,17 @@ register_custom_tiff_tags(TIFF *tif)
 }
 
 static void
+gain_to_whitebalance() {
+	float red_gain, blue_gain, green_gain;
+	green_gain = 1.0;
+
+	red_gain = (float)red_balance / (float)current.wb_gain_max * 2;
+	blue_gain = (float)blue_balance / (float)current.wb_gain_max * 2;
+
+
+}
+
+static void
 process_image(const int *p, int size)
 {
 	time_t rawtime;
@@ -596,8 +613,10 @@ process_image(const int *p, int size)
 	long sub_offset = 0;
 	uint64 exif_offset = 0;
 	static const short cfapatterndim[] = {2, 2};
-	static const float neutral[] = {1.0, 1.0, 1.0};
+	static float neutral[] = {1.0, 1.0, 1.0};
 	static uint16_t isospeed[] = {0};
+	float red, blue;
+	int red_mult, green_mult, blue_mult;
 
 	// Only process preview frames when not capturing
 	if (capture == 0) {
@@ -651,6 +670,18 @@ process_image(const int *p, int size)
 		// Get latest exposure and gain now the auto gain/exposure is disabled while capturing
 		gain = v4l2_ctrl_get(current.fd, current.gain_ctrl);
 		exposure = v4l2_ctrl_get(current.fd, V4L2_CID_EXPOSURE);
+		red_balance = v4l2_ctrl_get(current.fd, V4L2_CID_RED_BALANCE);
+		blue_balance = v4l2_ctrl_get(current.fd, V4L2_CID_BLUE_BALANCE);
+		gain_to_whitebalance(red_balance, blue_balance);
+		red = (float)red_balance / (float)current.wb_gain_max * 2;
+		blue = (float)blue_balance / (float)current.wb_gain_max * 2;
+		neutral[0] = red;
+		neutral[2] = blue;
+		green_mult = 256 / (1.0 / MIN(red, blue));
+		red_mult = green_mult * (1.0 / red);
+		blue_mult = green_mult * (1.0 / blue);
+
+		printf("red: %d, green: %d, blue: %d\n", red_mult, green_mult, blue_mult);
 
 		if(!(tif = TIFFOpen(fname, "w"))) {
 			printf("Could not open tiff\n");
@@ -699,9 +730,10 @@ process_image(const int *p, int size)
 		TIFFSetField(tif, TIFFTAG_SUBFILETYPE, 0);
 		TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, current.width);
 		TIFFSetField(tif, TIFFTAG_IMAGELENGTH, current.height);
-		TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 8);
+		TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, 16);
 		TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_CFA);
 		TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 1);
+		TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, 16);
 		TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
 		TIFFSetField(tif, TIFFTAG_CFAREPEATPATTERNDIM, cfapatterndim);
 		TIFFSetField(tif, TIFFTAG_CFAPATTERN, "\002\001\001\000"); // BGGR
@@ -714,9 +746,19 @@ process_image(const int *p, int size)
 		TIFFCheckpointDirectory(tif);
 		printf("Writing frame to %s\n", fname);
 		
-		unsigned char *pLine = (unsigned char*)malloc(current.width);
+		unsigned short *pLine = (unsigned short*)malloc(current.width * sizeof(short));
 		for(int row = 0; row < current.height; row++){
-			TIFFWriteScanline(tif, ((uint8_t *)p)+(row*current.width), row, 0);
+			for(int pixel = 0; pixel < current.width; pixel+=2) {
+				pLine[pixel] = (unsigned short)(((uint8_t*)p)[row*current.width+pixel]) * blue_mult;
+				pLine[pixel+1] = ((uint8_t*)p)[row*current.width+pixel+1] * green_mult;
+			}
+			TIFFWriteScanline(tif, pLine, row, 0);
+			row++;
+			for(int pixel = 0; pixel < current.width; pixel+=2) {
+				pLine[pixel] = ((uint8_t*)p)[row*current.width+pixel] * green_mult;
+				pLine[pixel+1] = ((uint8_t*)p)[row*current.width+pixel+1] * red_mult;
+			}
+			TIFFWriteScanline(tif, pLine, row, 0);
 		}
 		free(pLine);
 		TIFFWriteDirectory(tif);
@@ -1204,6 +1246,7 @@ on_shutter_clicked(GtkWidget *widget, gpointer user_data)
 	// Disable the autogain/exposure while taking the burst
 	v4l2_ctrl_set(current.fd, V4L2_CID_AUTOGAIN, 0);
 	v4l2_ctrl_set(current.fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+	v4l2_ctrl_set(current.fd, V4L2_CID_AUTO_WHITE_BALANCE, 0);
 
 	capture = burst_length;
 }
