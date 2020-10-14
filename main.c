@@ -920,7 +920,7 @@ read_frame(int fd)
 	if(current.type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		bytesused = buf.m.planes[0].bytesused;
 	else
-		bytesused = buf.m.planes[0].bytesused;
+		bytesused = buf.bytesused;
 
 	process_image(buffers[buf.index].start, bytesused);
 
